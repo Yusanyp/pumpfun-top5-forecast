@@ -1,0 +1,5 @@
+.env
+*.tar.gz
+out/
+makefun-keypair.json
+.makefun/credentials
