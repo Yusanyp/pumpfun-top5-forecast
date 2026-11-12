@@ -1,12 +1,3 @@
-// Horizon-aware forecast for pumpfun-top5-forecast-01.
-// Node 22, standard library only. Deterministic: a fixed seed drives every draw.
-//
-// One forecast is scored at every answer read, so the file is the mixture of the
-// predictive distributions at those reads. Parameters come from the snapshot
-// history itself (recent transitions on a formed board, with weak priors), which
-// keeps a short practice rehearsal and the long final window on the same model:
-// uncertainty and the chance a coin we have never seen takes a place both grow
-// with the gap between the last mark and each read.
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -82,7 +73,6 @@ const stepMs = stepMin * 60_000;
 const places = task.places;
 const edges = task.size.edges;
 
-/** log10(cap in SOL) = log10(lamports) - 9, exact enough past 2^53. */
 function logCap(lamports: string | number): number {
   const n = BigInt(lamports);
   if (n <= 0n) return -9;
@@ -200,7 +190,6 @@ for (const tr of transitions) {
     if (r.rank > 20) break;
     const nxt = tr.cur.rows.find((q) => q.mint === r.mint);
     if (!nxt) {
-      // Left the published rows: treat as a crash if it had been near the top.
       if (r.rank <= 12) {
         const shock = r.venue === 'curve' ? curveCrash : poolCrash;
         shock.push({ w: tr.w, x: -0.7 });
@@ -254,7 +243,6 @@ function shockOf(
 const poolShock = shockOf(poolCalm, poolCrash, crashPoolW, crashPoolN, 0.12, 0.01, 0.11, -0.55);
 const curveShock = shockOf(curveCalm, curveCrash, crashCurveW, crashCurveN, 0.28, -0.08, 0.16, -0.6);
 
-// Prior: about 0.7 serious new coins per step, some of them above the current leader.
 const lambda = Math.min(3.5, Math.max(0.15, (lambdaAcc + 0.7 * 4) / (lambdaW + 4)));
 const relFit = fitMeanSd(relSamples, -0.02, 0.28, 8);
 const relMean = Math.max(-0.45, Math.min(0.35, relFit.mean));
@@ -311,7 +299,6 @@ for (const iso of task.reads) {
 if (readSteps.length === 0) readSteps.push(1);
 const maxStep = Math.max(...readSteps);
 
-/** Place-k log cap on the last mark: the size model follows these levels, not one coin. */
 const lastPlaceLc: number[] = [];
 for (let k = 0; k < places; k++) {
   const row = last.rows.find((r) => r.rank === k + 1);
@@ -329,14 +316,12 @@ for (let k = 0; k < places; k++) {
     if (!a || !b) continue;
     deltas.push({ w: tr.w, x: (logCap(b.market_cap_lamports) - logCap(a.market_cap_lamports)) / tr.dt });
   }
-  // Mild upward prior: a new board's top drifts up, then the saturation below stops it running away.
   const priorDrift = 0.045 - k * 0.005;
   const fit = fitMeanSd(deltas, priorDrift, 0.1, 3);
   placeDrift.push(Math.max(-0.08, Math.min(0.22, fit.mean)));
   placeSd.push(Math.min(0.28, Math.max(0.05, fit.sd)));
 }
 
-/** Integrated drift over `s` steps, saturating with time so a 10-hour window does not explode. */
 function placeMean(k: number, s: number): number {
   const tau = 8;
   if (s <= 0) return lastPlaceLc[k]!;
@@ -384,18 +369,12 @@ function erfc(x: number): number {
     );
   return x >= 0 ? r : 2 - r;
 }
-/** P(X < x) for a normal. */
 const normalCdf = (x: number, mean: number, sd: number): number => 0.5 * erfc(-(x - mean) / (sd * Math.SQRT2));
 
 const rng = mulberry32(SEED);
 const gaussian = makeGaussian(rng);
 const random = rng;
 
-/**
- * Keep order and size observations separately.  A missing mint is intentional:
- * it represents a launch after the history cut, whose probability must remain
- * unnamed instead of being incorrectly assigned to an observed coin.
- */
 const orderObservations: Array<Map<string, number>> = Array.from({ length: places }, () => new Map());
 const sizeObservations: number[][] = Array.from({ length: places }, () => new Array(edges.length + 1).fill(0));
 let observationCount = 0;
@@ -403,7 +382,6 @@ let observationCount = 0;
 function binOf(x: number): number {
   if (x < edges[0]!) return 0;
   if (x >= edges[edges.length - 1]!) return edges.length;
-  // edges are a uniform 0.05 grid in this contest; fall back to a scan if not.
   const width = edges[1]! - edges[0]!;
   if (width > 0) {
     const i = Math.floor((x - edges[0]!) / width) + 1;
@@ -419,7 +397,6 @@ function evolveCoin(logcap: number, vel: number, pool: boolean, young: boolean, 
   if (young) pCrash = Math.min(0.72, pCrash * 1.7);
   if (sticky) pCrash *= 0.7;
   const jump = random() < pCrash;
-  // A brand-new print that is not already running reverts; sustained coins keep their calm mean.
   const fade = young ? (pool ? -0.055 : -0.11) : 0;
   const shock = (jump ? s.crashMean + s.crashSd * gaussian() : s.calmMean + s.calmSd * gaussian()) + fade;
   const carried = VEL_CARRY * vel;
@@ -460,7 +437,6 @@ function pruneUnseen(unseen: number[], born: number[], known: number[]): void {
   born.length = kept;
 }
 
-/** One draw evolves every answer horizon together, preserving their dependence. */
 function simulatePath(targetSteps: Set<number>): void {
   const knownCaps = coins.map((coin) => coin.logcap);
   const velocities = coins.map((coin) => coin.vel);
@@ -483,8 +459,6 @@ function simulatePath(targetSteps: Set<number>): void {
 
     const arrivals = poisson(random, lambda);
     for (let i = 0; i < arrivals && unseenCaps.length < MAX_NEW; i++) {
-      // Most launches cluster around the leader; rare right-tail launches create
-      // the uncertainty that should remain unnamed in the submitted forecast.
       const tail = random() < 0.18;
       const relative = relMean + relSd * (tail ? Math.abs(gaussian()) + 0.2 : gaussian());
       unseenCaps.push(leader + relative);
@@ -503,12 +477,6 @@ function simulatePath(targetSteps: Set<number>): void {
 const targets = new Set(readSteps);
 for (let draw = 0; draw < N_SIMS; draw++) simulatePath(targets);
 
-/**
- * Simulated frequencies are noisy in the tails.  Blend them with a small
- * rank-based prior, then reserve a horizon-dependent amount for coins that
- * launch after the input cut.  This is deliberately conservative because the
- * score is logarithmic and the same answer is evaluated at several reads.
- */
 function orderPrior(place: number): Map<string, number> {
   const weights = new Map<string, number>();
   let total = 0;
@@ -641,10 +609,6 @@ const nBins = edges.length + 1;
 const binLo = (b: number): number => (b <= 0 ? -Infinity : edges[b - 1]!);
 const binHi = (b: number): number => (b >= edges.length ? Infinity : edges[b]!);
 for (let k = 0; k < places; k++) {
-  // Equal mixture over the answer reads of a drifting place-cap, plus a small
-  // high-side component for a launch that resets the top. The coin simulation
-  // is a poor size model: when the leader crashes the next coin takes the place,
-  // so the place itself moves less than any one mint.
   const mix = new Array(nBins).fill(0);
   const skewW = 0.2 - k * 0.025;
   const nReads = readSteps.length;
@@ -668,8 +632,6 @@ for (let k = 0; k < places; k++) {
   let named = 0;
   for (let b = 0; b < nBins; b++) {
     const model = (1 - SIZE_UNIFORM) * calibratedMass[b]! + SIZE_UNIFORM / nBins;
-    // Sizes get a light empirical blend: their simulated distribution contains
-    // coin-level shocks, while the place model is steadier for long horizons.
     const p = model;
     const micro = Math.floor(p * 1_000_000 + 1e-9);
     if (micro >= MIN_SIZE_P * 1_000_000) {
@@ -677,7 +639,6 @@ for (let k = 0; k < places; k++) {
       named += micro;
     }
   }
-  // Keep the named bins' probabilities (leftover mass stays unnamed and is shared).
   void named;
   for (const row of rows) sizes.push({ place: k + 1, bin: row.bin, p: row.micro / 1_000_000 });
 }
