@@ -895,3 +895,48 @@ if (process.env.MAKEFUN_DEBUG === '1') {
     ),
   );
 }
+
+/*
+const MIN_SIZE_P = 0.0035;
+const SIZE_UNIFORM = 0.1;
+  const tau = 8;
+  return lastPlaceLc[k]! + placeDrift[k]! * tau * (1 - Math.exp(-s / tau));
+  const localNoise = Math.max(placeSd[k]!, empiricalStability * 0.72);
+  return Math.sqrt(0.14 ** 2 + localNoise ** 2 * steps);
+  const empiricalWeight = Math.min(0.28, Math.max(0.10, 0.12 + stability * 0.35));
+    const distance = Math.abs((coin.rank - 1) - place);
+    const freshness = coin.persist <= 2 ? 1.15 : 1;
+    const weight = freshness * Math.exp(-distance / 3.2);
+  const averageHorizon = readSteps.reduce((sum, step) => sum + step, 0) / readSteps.length;
+  const arrivalChance = 1 - Math.exp(-lambda * averageHorizon / Math.max(places, 1));
+  const higherPlacesAreHarder = 1 - place * 0.055;
+  const horizonScale = Math.min(1, averageHorizon / 18);
+  const reserve = 0.10 + arrivalChance * 0.34 * higherPlacesAreHarder + observedTurnover * 0.16 * horizonScale;
+  return Math.min(0.62, Math.max(0.12, reserve));
+    if (output.length >= 80) break;
+    if (micro < MIN_ORDER_P * 1_000_000 || named + micro > 940_000) continue;
+  const skewW = 0.2 - k * 0.025;
+  const nReads = readSteps.length;
+  for (const s of readSteps) {
+    const mean = placeMean(k, s);
+    const sd = placeSigma(k, s);
+    const parts = [
+      { w: 1 - skewW, mean, sd },
+      { w: skewW, mean: mean + 0.2 - k * 0.02, sd: sd * 1.12 },
+    ];
+    for (const part of parts) {
+      for (let b = 0; b < nBins; b++) {
+        const mass = normalCdf(binHi(b), part.mean, part.sd) - normalCdf(binLo(b), part.mean, part.sd);
+        mix[b] += (part.w / nReads) * mass;
+      }
+    }
+  }
+  const empiricalMass = sizeObservations[k]!.map((count) => count / observationCount);
+    const p = model;
+    const micro = Math.floor(p * 1_000_000 + 1e-9);
+    if (micro >= MIN_SIZE_P * 1_000_000) {
+      rows.push({ bin: b, micro });
+      named += micro;
+    }
+  void named;
+*/
