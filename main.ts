@@ -371,12 +371,17 @@ function erfc(x: number): number {
 const normalCdf = (x: number, mean: number, sd: number): number => 0.5 * erfc(-(x - mean) / (sd * Math.SQRT2));
 
 const rng = mulberry32(SEED);
-const gauss = makeGaussian(rng);
-const uni = rng;
+const gaussian = makeGaussian(rng);
+const random = rng;
 
-const orderHits: Array<Map<string, number>> = Array.from({ length: places }, () => new Map());
-const sizeHits: number[][] = Array.from({ length: places }, () => new Array(edges.length + 1).fill(0));
-let samples = 0;
+/**
+ * Keep order and size observations separately.  A missing mint is intentional:
+ * it represents a launch after the history cut, whose probability must remain
+ * unnamed instead of being incorrectly assigned to an observed coin.
+ */
+const orderObservations: Array<Map<string, number>> = Array.from({ length: places }, () => new Map());
+const sizeObservations: number[][] = Array.from({ length: places }, () => new Array(edges.length + 1).fill(0));
+let observationCount = 0;
 
 function binOf(x: number): number {
   if (x < edges[0]!) return 0;
@@ -391,119 +396,159 @@ function binOf(x: number): number {
   return edges.length;
 }
 
-function stepCoin(logcap: number, vel: number, pool: boolean, young: boolean, sticky: boolean): { logcap: number; vel: number } {
+function evolveCoin(logcap: number, vel: number, pool: boolean, young: boolean, sticky: boolean): { logcap: number; vel: number } {
   const s = pool ? poolShock : curveShock;
   let pCrash = s.crashP;
   if (young) pCrash = Math.min(0.72, pCrash * 1.7);
   if (sticky) pCrash *= 0.7;
-  const jump = uni() < pCrash;
+  const jump = random() < pCrash;
   // A brand-new print that is not already running reverts; sustained coins keep their calm mean.
   const fade = young ? (pool ? -0.055 : -0.11) : 0;
-  const shock = (jump ? s.crashMean + s.crashSd * gauss() : s.calmMean + s.calmSd * gauss()) + fade;
+  const shock = (jump ? s.crashMean + s.crashSd * gaussian() : s.calmMean + s.calmSd * gaussian()) + fade;
   const carried = VEL_CARRY * vel;
   const next = logcap + carried + shock;
   return { logcap: next, vel: vel * VEL_DECAY };
 }
 
-for (let sim = 0; sim < N_SIMS; sim++) {
-  const logcaps = coins.map((c) => c.logcap);
-  const vels = coins.map((c) => c.vel);
-  const bornAt = coins.map(() => -1_000);
-  const news: number[] = [];
-  const newsBorn: number[] = [];
-  let cursor = 0;
-  const targets = new Map<number, number[]>();
-  for (let r = 0; r < readSteps.length; r++) {
-    const list = targets.get(readSteps[r]!) ?? [];
-    list.push(r);
-    targets.set(readSteps[r]!, list);
-  }
-  const record = () => {
-    const ids: Array<{ id: number; lc: number; mint: string | null }> = [];
-    for (let i = 0; i < coins.length; i++) ids.push({ id: i, lc: logcaps[i]!, mint: coins[i]!.mint });
-    for (let j = 0; j < news.length; j++) ids.push({ id: 1000 + j, lc: news[j]!, mint: null });
-    ids.sort((a, b) => b.lc - a.lc || (a.mint && b.mint ? (a.mint < b.mint ? -1 : 1) : a.id - b.id));
-    for (let k = 0; k < places; k++) {
-      const row = ids[k];
-      sizeHits[k]![binOf(row ? row.lc : 0)] += 1;
-      if (row?.mint) {
-        const m = orderHits[k]!;
-        m.set(row.mint, (m.get(row.mint) ?? 0) + 1);
-      }
+function recordBoard(known: number[], unseen: number[]): void {
+  const board: Array<{ id: number; logcap: number; mint: string | null }> = [];
+  for (let i = 0; i < coins.length; i++) board.push({ id: i, logcap: known[i]!, mint: coins[i]!.mint });
+  for (let i = 0; i < unseen.length; i++) board.push({ id: coins.length + i, logcap: unseen[i]!, mint: null });
+  board.sort((a, b) => b.logcap - a.logcap || (a.mint && b.mint ? (a.mint < b.mint ? -1 : 1) : a.id - b.id));
+  for (let k = 0; k < places; k++) {
+    const row = board[k];
+    sizeObservations[k]![binOf(row?.logcap ?? 0)] += 1;
+    if (row?.mint) {
+      const observed = orderObservations[k]!;
+      observed.set(row.mint, (observed.get(row.mint) ?? 0) + 1);
     }
-    samples += 1;
-  };
-  if (targets.has(0)) record();
+  }
+  observationCount += 1;
+}
+
+function pruneUnseen(unseen: number[], born: number[], known: number[]): void {
+  if (unseen.length <= 80) return;
+  let threshold = -Infinity;
+  for (const cap of known) threshold = Math.max(threshold, cap);
+  threshold -= 1.6;
+  let kept = 0;
+  for (let i = 0; i < unseen.length; i++) {
+    if (unseen[i]! >= threshold) {
+      unseen[kept] = unseen[i]!;
+      born[kept] = born[i]!;
+      kept += 1;
+    }
+  }
+  unseen.length = kept;
+  born.length = kept;
+}
+
+/** One draw evolves every answer horizon together, preserving their dependence. */
+function simulatePath(targetSteps: Set<number>): void {
+  const knownCaps = coins.map((coin) => coin.logcap);
+  const velocities = coins.map((coin) => coin.vel);
+  const unseenCaps: number[] = [];
+  const unseenBorn: number[] = [];
+  if (targetSteps.has(0)) recordBoard(knownCaps, unseenCaps);
+
   for (let step = 1; step <= maxStep; step++) {
-    let leader = -10;
-    for (const lc of logcaps) if (lc > leader) leader = lc;
-    for (const lc of news) if (lc > leader) leader = lc;
+    let leader = -Infinity;
+    for (const cap of knownCaps) leader = Math.max(leader, cap);
+    for (const cap of unseenCaps) leader = Math.max(leader, cap);
+
     for (let i = 0; i < coins.length; i++) {
-      const c = coins[i]!;
-      const age = c.ageMin + step * stepMin;
-      const young = age < 14 && c.persist <= 2;
-      const sticky = c.persist >= 4 && c.pool;
-      const nxt = stepCoin(logcaps[i]!, vels[i]!, c.pool, young, sticky);
-      logcaps[i] = nxt.logcap;
-      vels[i] = nxt.vel;
-      void bornAt;
+      const coin = coins[i]!;
+      const age = coin.ageMin + step * stepMin;
+      const state = evolveCoin(knownCaps[i]!, velocities[i]!, coin.pool, age < 14 && coin.persist <= 2, coin.persist >= 4 && coin.pool);
+      knownCaps[i] = state.logcap;
+      velocities[i] = state.vel;
     }
-    const nNew = poisson(uni, lambda);
-    for (let j = 0; j < nNew && news.length < MAX_NEW; j++) {
-      // Modest right skew: most launches land near the leaders, a few clear the top.
-      const rel = relMean + relSd * (uni() < 0.18 ? Math.abs(gauss()) + 0.2 : gauss());
-      news.push(leader + rel);
-      newsBorn.push(step);
+
+    const arrivals = poisson(random, lambda);
+    for (let i = 0; i < arrivals && unseenCaps.length < MAX_NEW; i++) {
+      // Most launches cluster around the leader; rare right-tail launches create
+      // the uncertainty that should remain unnamed in the submitted forecast.
+      const tail = random() < 0.18;
+      const relative = relMean + relSd * (tail ? Math.abs(gaussian()) + 0.2 : gaussian());
+      unseenCaps.push(leader + relative);
+      unseenBorn.push(step);
     }
-    for (let j = 0; j < news.length; j++) {
-      const age = (step - newsBorn[j]!) * stepMin;
-      const nxt = stepCoin(news[j]!, 0, true, age < 20, false);
-      news[j] = nxt.logcap;
+
+    for (let i = 0; i < unseenCaps.length; i++) {
+      const age = (step - unseenBorn[i]!) * stepMin;
+      unseenCaps[i] = evolveCoin(unseenCaps[i]!, 0, true, age < 20, false).logcap;
     }
-    // Drop newcomers that can no longer reach the top of the board.
-    if (news.length > 80) {
-      let floor = leader;
-      for (const lc of logcaps) if (lc > floor) floor = lc;
-      floor -= 1.6;
-      let w = 0;
-      for (let j = 0; j < news.length; j++) {
-        if (news[j]! >= floor) {
-          news[w] = news[j]!;
-          newsBorn[w] = newsBorn[j]!;
-          w += 1;
-        }
-      }
-      news.length = w;
-      newsBorn.length = w;
-    }
-    if (targets.has(step)) record();
-    void cursor;
+    pruneUnseen(unseenCaps, unseenBorn, knownCaps);
+    if (targetSteps.has(step)) recordBoard(knownCaps, unseenCaps);
   }
+}
+
+const targets = new Set(readSteps);
+for (let draw = 0; draw < N_SIMS; draw++) simulatePath(targets);
+
+/**
+ * Simulated frequencies are noisy in the tails.  Blend them with a small
+ * rank-based prior, then reserve a horizon-dependent amount for coins that
+ * launch after the input cut.  This is deliberately conservative because the
+ * score is logarithmic and the same answer is evaluated at several reads.
+ */
+function orderPrior(place: number): Map<string, number> {
+  const weights = new Map<string, number>();
+  let total = 0;
+  for (const coin of coins) {
+    const distance = Math.abs((coin.rank - 1) - place);
+    const freshness = coin.persist <= 2 ? 1.15 : 1;
+    const weight = freshness * Math.exp(-distance / 3.2);
+    weights.set(coin.mint, weight);
+    total += weight;
+  }
+  for (const [mint, weight] of weights) weights.set(mint, weight / total);
+  return weights;
+}
+
+function unknownReserve(place: number): number {
+  const averageHorizon = readSteps.reduce((sum, step) => sum + step, 0) / readSteps.length;
+  const arrivalChance = 1 - Math.exp(-lambda * averageHorizon / Math.max(places, 1));
+  const higherPlacesAreHarder = 1 - place * 0.055;
+  return Math.min(0.62, Math.max(0.12, 0.11 + arrivalChance * 0.42 * higherPlacesAreHarder));
+}
+
+function calibratedRows(place: number): Array<{ mint: string; micro: number }> {
+  const hits = orderObservations[place]!;
+  const prior = orderPrior(place);
+  const reserve = unknownReserve(place);
+  const pseudoCount = Math.max(80, observationCount * 0.018);
+  const candidates = new Set<string>([...hits.keys(), ...prior.keys()]);
+  const rows: Array<{ mint: string; p: number }> = [];
+  for (const mint of candidates) {
+    const empirical = (hits.get(mint) ?? 0) / observationCount;
+    const baseline = prior.get(mint) ?? 0;
+    const smoothed = (empirical * observationCount + baseline * pseudoCount) / (observationCount + pseudoCount);
+    const p = smoothed * (1 - reserve);
+    if (p >= MIN_ORDER_P) rows.push({ mint, p });
+  }
+  rows.sort((a, b) => b.p - a.p || (a.mint < b.mint ? -1 : 1));
+  const output: Array<{ mint: string; micro: number }> = [];
+  let named = 0;
+  for (const row of rows) {
+    if (output.length >= 80) break;
+    const micro = Math.floor(row.p * 1_000_000 + 1e-9);
+    if (micro < MIN_ORDER_P * 1_000_000 || named + micro > 940_000) continue;
+    output.push({ mint: row.mint, micro });
+    named += micro;
+  }
+  return output;
 }
 
 const probabilities: Array<{ mint: string; place: number; p: number }> = [];
 for (let k = 0; k < places; k++) {
-  const rows: Array<{ mint: string; micro: number }> = [];
-  for (const [mint, hits] of orderHits[k]!) {
-    const micro = Math.floor((hits / samples) * 1_000_000 + 1e-9);
-    if (micro >= MIN_ORDER_P * 1_000_000) rows.push({ mint, micro });
-  }
-  rows.sort((a, b) => b.micro - a.micro || (a.mint < b.mint ? -1 : 1));
-  let sum = 0;
-  const kept: Array<{ mint: string; micro: number }> = [];
-  for (const row of rows) {
-    if (kept.length >= 80) break;
-    if (sum + row.micro > 1_000_000) break;
-    kept.push(row);
-    sum += row.micro;
-  }
-  for (const row of kept) probabilities.push({ mint: row.mint, place: k + 1, p: row.micro / 1_000_000 });
+  for (const row of calibratedRows(k)) probabilities.push({ mint: row.mint, place: k + 1, p: row.micro / 1_000_000 });
 }
 
 const score = new Map<string, number>();
 for (let k = 0; k < places; k++) {
-  for (const [mint, hits] of orderHits[k]!) {
-    score.set(mint, (score.get(mint) ?? 0) + (hits / samples) * (places + 1 - (k + 1)));
+  for (const [mint, hits] of orderObservations[k]!) {
+    score.set(mint, (score.get(mint) ?? 0) + (hits / observationCount) * (places - k));
   }
 }
 const ranked = [...score.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
@@ -546,7 +591,11 @@ for (let k = 0; k < places; k++) {
   const rows: Array<{ bin: number; micro: number }> = [];
   let named = 0;
   for (let b = 0; b < nBins; b++) {
-    const p = (1 - SIZE_UNIFORM) * mix[b]! + SIZE_UNIFORM / nBins;
+    const empirical = sizeObservations[k]![b]! / observationCount;
+    const model = (1 - SIZE_UNIFORM) * mix[b]! + SIZE_UNIFORM / nBins;
+    // Sizes get a light empirical blend: their simulated distribution contains
+    // coin-level shocks, while the place model is steadier for long horizons.
+    const p = 0.18 * empirical + 0.82 * model;
     const micro = Math.floor(p * 1_000_000 + 1e-9);
     if (micro >= MIN_SIZE_P * 1_000_000) {
       rows.push({ bin: b, micro });
@@ -580,7 +629,7 @@ if (process.env.MAKEFUN_DEBUG === '1') {
         pool: poolShock,
         curve: curveShock,
         readSteps,
-        samples,
+        samples: observationCount,
         coins: coins.slice(0, 8).map((c) => ({
           mint: c.mint.slice(0, 6),
           rank: c.rank,
