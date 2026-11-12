@@ -14,12 +14,6 @@ const MIN_SIZE_P = 0.0025;
 const SIZE_UNIFORM = 0.015;
 const VEL_CARRY = 0.42;
 const VEL_DECAY = 0.5;
-const PLACE_EXPLOSION = [0.72, 0.4, 0.28, 0.2, 0.16];
-const SIZE_MIX = [
-  { w: 0.5, shift: 0, sdMul: 0.82 },
-  { w: 0.35, shift: 0.42, sdMul: 1.15 },
-  { w: 0.15, shift: -0.1, sdMul: 0.78 },
-];
 
 interface Task {
   places: number;
@@ -328,18 +322,12 @@ for (let k = 0; k < places; k++) {
   placeSd.push(Math.min(0.28, Math.max(0.05, fit.sd)));
 }
 
-function horizonScale(s: number): number {
-  const tau = 10;
-  if (s <= 0) return 0;
-  return 1 - Math.exp(-s / tau);
-}
-
 function placeMean(k: number, s: number): number {
+  const tau = 10;
   if (s <= 0) return lastPlaceLc[k]!;
-  const hs = horizonScale(s);
-  const local = placeDrift[k]! * Math.min(s, 12);
-  const explosion = (PLACE_EXPLOSION[k] ?? 0.12) * (0.15 + 0.85 * hs);
-  return lastPlaceLc[k]! + local * 0.3 + explosion;
+  const hs = 1 - Math.exp(-s / tau);
+  const boom = [0.72, 0.4, 0.28, 0.2, 0.16][k] ?? 0.12;
+  return lastPlaceLc[k]! + placeDrift[k]! * Math.min(s, 12) * 0.3 + boom * (0.15 + 0.85 * hs);
 }
 function placeSigma(k: number, s: number): number {
   const steps = Math.max(s, 1);
@@ -501,8 +489,8 @@ function orderPrior(place: number): Map<string, number> {
     const freshness = coin.persist <= 2 ? 1.2 : coin.persist >= 4 ? 0.92 : 1;
     const momentum = coin.vel > 0.08 ? 1.35 : coin.vel > 0 ? 1.12 : coin.vel < -0.15 ? 0.7 : 1;
     const poolBoost = coin.pool ? 1.18 : 0.82;
-    const risingIntoBoard = coin.rank <= 12 && coin.vel > 0.12 ? 1.45 : 1;
-    const weight = freshness * momentum * poolBoost * risingIntoBoard * Math.exp(-distance / 2.8);
+    const rising = coin.rank <= 12 && coin.vel > 0.12 ? 1.45 : 1;
+    const weight = freshness * momentum * poolBoost * rising * Math.exp(-distance / 2.8);
     weights.set(coin.mint, weight);
     total += weight;
   }
@@ -517,11 +505,7 @@ function unknownReserve(place: number): number {
   const observedTurnover = recentTurnover(place);
   const hs = Math.min(1.15, averageHorizon / 8);
   const reserve =
-    0.18 +
-    placeBias +
-    arrivalChance * 0.38 * (1 - place * 0.035) +
-    observedTurnover * 0.28 * Math.max(0.35, hs) +
-    Math.min(0.18, hs * 0.12);
+    0.18 + placeBias + arrivalChance * 0.38 * (1 - place * 0.035) + observedTurnover * 0.28 * Math.max(0.35, hs) + Math.min(0.18, hs * 0.12);
   return Math.min(0.8, Math.max(0.24, reserve));
 }
 
@@ -579,21 +563,6 @@ function reserveDiagnostics(): Array<{ place: number; reserve: number; turnover:
   return values;
 }
 
-function chartBlockers(positive: Set<string>): string[] {
-  const scores = new Map<string, number>();
-  for (const mark of marks.slice(-Math.min(marks.length, 4))) {
-    for (const row of mark.rows) {
-      if (row.rank > 100) continue;
-      scores.set(row.mint, (scores.get(row.mint) ?? 0) + (row.rank <= 60 ? 3 : 1));
-    }
-  }
-  return [...scores.entries()]
-    .filter(([mint]) => !positive.has(mint))
-    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
-    .slice(0, 90)
-    .map(([mint]) => mint);
-}
-
 function calibratedRows(place: number): Array<{ mint: string; micro: number }> {
   const hits = orderObservations[place]!;
   const prior = orderPrior(place);
@@ -601,22 +570,12 @@ function calibratedRows(place: number): Array<{ mint: string; micro: number }> {
   const pseudoCount = Math.max(80, observationCount * 0.018);
   const candidates = new Set<string>([...hits.keys(), ...prior.keys()]);
   const rows: Array<{ mint: string; p: number }> = [];
-  const coinByMint = new Map(coins.map((c) => [c.mint, c]));
-  const raw: Array<{ mint: string; w: number }> = [];
-  let rawSum = 0;
   for (const mint of candidates) {
-    const empirical = (hits.get(mint) ?? 0) / Math.max(1, observationCount);
+    const empirical = (hits.get(mint) ?? 0) / observationCount;
     const baseline = prior.get(mint) ?? 0;
     const smoothed = (empirical * observationCount + baseline * pseudoCount) / (observationCount + pseudoCount);
-    const coin = coinByMint.get(mint);
-    const riseBoost = coin && coin.vel > 0.1 && coin.pool && coin.rank <= 15 ? 1.25 : 1;
-    const tempered = Math.pow(Math.max(smoothed * riseBoost, 1e-12), 0.9);
-    raw.push({ mint, w: tempered });
-    rawSum += tempered;
-  }
-  for (const row of raw) {
-    const p = (row.w / Math.max(rawSum, 1e-12)) * (1 - reserve);
-    if (p >= MIN_ORDER_P) rows.push({ mint: row.mint, p });
+    const p = smoothed * (1 - reserve);
+    if (p >= MIN_ORDER_P) rows.push({ mint, p });
   }
   rows.sort((a, b) => b.p - a.p || (a.mint < b.mint ? -1 : 1));
   const output: Array<{ mint: string; micro: number }> = [];
@@ -630,11 +589,13 @@ function calibratedRows(place: number): Array<{ mint: string; micro: number }> {
     named += micro;
   }
   const used = new Set(output.map((r) => r.mint));
-  for (const mint of chartBlockers(used)) {
-    if (output.length >= 100) break;
-    if (used.has(mint)) continue;
-    output.push({ mint, micro: 0 });
-    used.add(mint);
+  for (const mark of marks.slice(-Math.min(marks.length, 4))) {
+    for (const row of mark.rows) {
+      if (output.length >= 100) break;
+      if (row.rank > 100 || used.has(row.mint)) continue;
+      output.push({ mint: row.mint, micro: 0 });
+      used.add(row.mint);
+    }
   }
   return output;
 }
@@ -665,10 +626,7 @@ const sizes: Array<{ place: number; bin: number; p: number }> = [];
 const nBins = edges.length + 1;
 const binLo = (b: number): number => (b <= 0 ? -Infinity : edges[b - 1]!);
 const binHi = (b: number): number => (b >= edges.length ? Infinity : edges[b]!);
-const sizeHorizon =
-  readSteps.length === 0
-    ? 1
-    : readSteps.slice().sort((a, b) => a - b)[Math.floor((readSteps.length - 1) / 2)]!;
+const sizeHorizon = readSteps.slice().sort((a, b) => a - b)[Math.floor((Math.max(readSteps.length, 1) - 1) / 2)] ?? 1;
 const sizeHorizonHi = Math.max(...readSteps, sizeHorizon);
 const sizeHorizonLo = Math.min(...readSteps, sizeHorizon);
 for (let k = 0; k < places; k++) {
@@ -676,11 +634,14 @@ for (let k = 0; k < places; k++) {
   const mean = placeMean(k, sizeHorizon);
   const span = Math.max(0, placeMean(k, sizeHorizonHi) - placeMean(k, sizeHorizonLo));
   const sd = Math.sqrt(placeSigma(k, sizeHorizon) ** 2 + (span / 2.5) ** 2);
-  for (const part of SIZE_MIX) {
-    const partMean = mean + part.shift * (0.85 + 0.05 * k);
-    const partSd = Math.max(0.08, sd * part.sdMul);
+  const parts = [
+    { w: 0.5, mean, sd: sd * 0.82 },
+    { w: 0.35, mean: mean + 0.42 * (0.85 + 0.05 * k), sd: sd * 1.15 },
+    { w: 0.15, mean: mean - 0.1 * (0.85 + 0.05 * k), sd: sd * 0.78 },
+  ];
+  for (const part of parts) {
     for (let b = 0; b < nBins; b++) {
-      const mass = normalCdf(binHi(b), partMean, partSd) - normalCdf(binLo(b), partMean, partSd);
+      const mass = normalCdf(binHi(b), part.mean, Math.max(0.08, part.sd)) - normalCdf(binLo(b), part.mean, Math.max(0.08, part.sd));
       mix[b] += part.w * mass;
     }
   }
