@@ -330,7 +330,7 @@ function placeMean(k: number, s: number): number {
 function placeSigma(k: number, s: number): number {
   const steps = Math.max(s, 1);
   const empiricalStability = rankStability(k);
-  const localNoise = Math.max(placeSd[k]!, empiricalStability * 0.5);
+  const localNoise = Math.max(placeSd[k]!, empiricalStability * 0.72);
   return Math.min(0.38, Math.max(0.09, 0.09 + k * 0.005 + Math.min(0.28, 0.04 * Math.log1p(steps) + localNoise * Math.sqrt(Math.min(steps, 24) / 12))));
 }
 
