@@ -6,6 +6,8 @@
 
 Deterministic offline forecast of which new pump.fun coins will hold the top 5 market-cap places, and how large each place will be. It estimates turnover and place-size drift from the 10-minute snapshot history, then mixes the outlook at every answer read.
 
+The forecast deliberately reserves probability for launches after the history cut, and uses smoothing to avoid overconfident sparse Monte Carlo cells under the logarithmic score.
+
 ## Run it
 
 ```sh

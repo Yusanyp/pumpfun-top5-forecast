@@ -1,5 +1,10 @@
-.env
-*.tar.gz
+# Local forecast outputs and make.fun bundles are generated artifacts.
+output/
 out/
-makefun-keypair.json
-.makefun/credentials
+forecast.json
+transcripts.tar.gz
+
+# Secrets and editor state never belong in an entry.
+.env
+.env.*
+.vscode/

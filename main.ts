@@ -344,7 +344,24 @@ function placeMean(k: number, s: number): number {
 }
 function placeSigma(k: number, s: number): number {
   const steps = Math.max(s, 1);
-  return Math.sqrt(0.16 ** 2 + placeSd[k]! ** 2 * steps);
+  const empiricalStability = rankStability(k);
+  const localNoise = Math.max(placeSd[k]!, empiricalStability * 0.72);
+  return Math.sqrt(0.14 ** 2 + localNoise ** 2 * steps);
+}
+
+function blendSizeMass(model: number[], empirical: number[], place: number): number[] {
+  const result = new Array(model.length).fill(0);
+  const stability = rankStability(place);
+  const empiricalWeight = Math.min(0.28, Math.max(0.10, 0.12 + stability * 0.35));
+  let total = 0;
+  for (let bin = 0; bin < model.length; bin++) {
+    const value = (1 - empiricalWeight) * model[bin]! + empiricalWeight * empirical[bin]!;
+    result[bin] = Math.max(0, value);
+    total += result[bin]!;
+  }
+  if (total <= 0) return model.slice();
+  for (let bin = 0; bin < result.length; bin++) result[bin] /= total;
+  return result;
 }
 
 function erfc(x: number): number {
@@ -510,7 +527,64 @@ function unknownReserve(place: number): number {
   const averageHorizon = readSteps.reduce((sum, step) => sum + step, 0) / readSteps.length;
   const arrivalChance = 1 - Math.exp(-lambda * averageHorizon / Math.max(places, 1));
   const higherPlacesAreHarder = 1 - place * 0.055;
-  return Math.min(0.62, Math.max(0.12, 0.11 + arrivalChance * 0.42 * higherPlacesAreHarder));
+  const observedTurnover = recentTurnover(place);
+  const horizonScale = Math.min(1, averageHorizon / 18);
+  const reserve = 0.10 + arrivalChance * 0.34 * higherPlacesAreHarder + observedTurnover * 0.16 * horizonScale;
+  return Math.min(0.62, Math.max(0.12, reserve));
+}
+
+/**
+ * Recent top-board turnover is a useful calibration signal independent of the
+ * simulated arrival rate.  It measures whether a coin at a given place stays
+ * in the next mark, while treating a new high-ranking mint as turnover.
+ */
+function recentTurnover(place: number): number {
+  const start = Math.max(1, marks.length - 8);
+  let transitions = 0;
+  let changes = 0;
+  for (let index = start; index < marks.length; index++) {
+    const previous = marks[index - 1]!;
+    const current = marks[index]!;
+    const oldRow = previous.rows.find((row) => row.rank === place + 1);
+    const newRow = current.rows.find((row) => row.rank === place + 1);
+    if (!oldRow || !newRow) continue;
+    transitions += 1;
+    if (oldRow.mint !== newRow.mint) changes += 1;
+  }
+  if (transitions === 0) return 0.25;
+  const empirical = changes / transitions;
+  // A beta prior keeps the five-mark rehearsal from producing extreme values.
+  return (changes + 1.5) / (transitions + 6) * 0.55 + empirical * 0.45;
+}
+
+function rankStability(place: number): number {
+  const start = Math.max(1, marks.length - 8);
+  const levels: number[] = [];
+  for (let index = start; index < marks.length; index++) {
+    const row = marks[index]!.rows.find((item) => item.rank === place + 1);
+    if (row) levels.push(logCap(row.market_cap_lamports));
+  }
+  if (levels.length < 2) return 0.2;
+  let mean = 0;
+  for (const value of levels) mean += value;
+  mean /= levels.length;
+  let variance = 0;
+  for (const value of levels) variance += (value - mean) ** 2;
+  variance /= levels.length - 1;
+  return Math.max(0.04, Math.min(0.35, Math.sqrt(variance)));
+}
+
+function reserveDiagnostics(): Array<{ place: number; reserve: number; turnover: number; stability: number }> {
+  const values: Array<{ place: number; reserve: number; turnover: number; stability: number }> = [];
+  for (let place = 0; place < places; place++) {
+    values.push({
+      place: place + 1,
+      reserve: Number(unknownReserve(place).toFixed(4)),
+      turnover: Number(recentTurnover(place).toFixed(4)),
+      stability: Number(rankStability(place).toFixed(4)),
+    });
+  }
+  return values;
 }
 
 function calibratedRows(place: number): Array<{ mint: string; micro: number }> {
@@ -588,14 +662,15 @@ for (let k = 0; k < places; k++) {
       }
     }
   }
+  const empiricalMass = sizeObservations[k]!.map((count) => count / observationCount);
+  const calibratedMass = blendSizeMass(mix, empiricalMass, k);
   const rows: Array<{ bin: number; micro: number }> = [];
   let named = 0;
   for (let b = 0; b < nBins; b++) {
-    const empirical = sizeObservations[k]![b]! / observationCount;
-    const model = (1 - SIZE_UNIFORM) * mix[b]! + SIZE_UNIFORM / nBins;
+    const model = (1 - SIZE_UNIFORM) * calibratedMass[b]! + SIZE_UNIFORM / nBins;
     // Sizes get a light empirical blend: their simulated distribution contains
     // coin-level shocks, while the place model is steadier for long horizons.
-    const p = 0.18 * empirical + 0.82 * model;
+    const p = model;
     const micro = Math.floor(p * 1_000_000 + 1e-9);
     if (micro >= MIN_SIZE_P * 1_000_000) {
       rows.push({ bin: b, micro });
@@ -607,6 +682,71 @@ for (let k = 0; k < places; k++) {
   for (const row of rows) sizes.push({ place: k + 1, bin: row.bin, p: row.micro / 1_000_000 });
 }
 
+/**
+ * Validate the wire format before serialising: malformed output scores zero.
+ */
+function sumByPlace<T extends { place: number; p: number }>(rows: T[]): Map<number, number> {
+  const sums = new Map<number, number>();
+  for (const row of rows) sums.set(row.place, (sums.get(row.place) ?? 0) + row.p);
+  return sums;
+}
+
+function finiteProbability(value: number, label: string): void {
+  if (!Number.isFinite(value) || value < 0 || value > 1) throw new Error(label + ' must be in [0, 1]');
+}
+
+function validateOrderRows(rows: Array<{ mint: string; place: number; p: number }>): void {
+  const seen = new Set<string>();
+  const counts = new Map<number, number>();
+  for (const row of rows) {
+    if (!Number.isInteger(row.place) || row.place < 1 || row.place > places) throw new Error('invalid order place');
+    if (typeof row.mint !== 'string' || row.mint.length < 32 || row.mint.length > 44) throw new Error('invalid order mint');
+    finiteProbability(row.p, 'order probability');
+    const key = String(row.place) + ':' + row.mint;
+    if (seen.has(key)) throw new Error('duplicate mint at a place');
+    seen.add(key);
+    counts.set(row.place, (counts.get(row.place) ?? 0) + 1);
+  }
+  for (const count of counts.values()) if (count > 100) throw new Error('too many order rows');
+  for (const sum of sumByPlace(rows).values()) if (sum > 1 + 1e-9) throw new Error('order probability exceeds one');
+}
+
+function validateSizeRows(rows: Array<{ place: number; bin: number; p: number }>): void {
+  const seen = new Set<string>();
+  const bins = edges.length + 1;
+  const counts = new Map<number, number>();
+  for (const row of rows) {
+    if (!Number.isInteger(row.place) || row.place < 1 || row.place > places) throw new Error('invalid size place');
+    if (!Number.isInteger(row.bin) || row.bin < 0 || row.bin >= bins) throw new Error('invalid size bin');
+    finiteProbability(row.p, 'size probability');
+    const key = String(row.place) + ':' + String(row.bin);
+    if (seen.has(key)) throw new Error('duplicate size bin at a place');
+    seen.add(key);
+    counts.set(row.place, (counts.get(row.place) ?? 0) + 1);
+  }
+  for (const count of counts.values()) if (count > bins) throw new Error('too many size rows');
+  for (const sum of sumByPlace(rows).values()) if (sum > 1 + 1e-9) throw new Error('size probability exceeds one');
+}
+
+function validateTop5(rows: string[]): void {
+  if (rows.length !== places) throw new Error('top5 has wrong length');
+  const seen = new Set<string>();
+  for (const mint of rows) {
+    if (typeof mint !== 'string' || mint.length < 32 || mint.length > 44) throw new Error('invalid top5 mint');
+    if (seen.has(mint)) throw new Error('top5 must be distinct');
+    seen.add(mint);
+  }
+}
+
+function validateForecast(): void {
+  validateOrderRows(probabilities);
+  validateTop5(top5);
+  validateSizeRows(sizes);
+  if (probabilities.length > places * 100) throw new Error('too many order rows');
+  if (sizes.length > places * (edges.length + 1)) throw new Error('too many size rows');
+}
+
+validateForecast();
 const forecast = { probabilities, top5, sizes };
 const text = `${JSON.stringify(forecast)}\n`;
 if (text.length > 1_048_576) throw new Error(`forecast is ${text.length} bytes`);
