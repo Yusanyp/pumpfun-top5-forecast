@@ -325,13 +325,13 @@ for (let k = 0; k < places; k++) {
 function placeMean(k: number, s: number): number {
   const tau = 8;
   if (s <= 0) return lastPlaceLc[k]!;
-  return lastPlaceLc[k]! + placeDrift[k]! * tau * (1 - Math.exp(-s / tau));
+  return lastPlaceLc[k]! + placeDrift[k]! * tau * (1 - Math.exp(-s / tau)) + ([0.55, 0.32, 0.24, 0.18, 0.14][k] ?? 0.12) * (1 - Math.exp(-s / 10));
 }
 function placeSigma(k: number, s: number): number {
   const steps = Math.max(s, 1);
   const empiricalStability = rankStability(k);
   const localNoise = Math.max(placeSd[k]!, empiricalStability * 0.72);
-  return Math.sqrt(0.14 ** 2 + localNoise ** 2 * steps);
+  return Math.min(0.38, Math.max(0.09, 0.09 + k * 0.005 + Math.min(0.28, 0.04 * Math.log1p(steps) + localNoise * Math.sqrt(Math.min(steps, 24) / 12))));
 }
 
 function blendSizeMass(model: number[], empirical: number[], place: number): number[] {
