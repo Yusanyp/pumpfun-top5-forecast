@@ -823,6 +823,33 @@ function validateKnownMints(): void {
   }
 }
 
+function validateOrderCoverage(): void {
+  const byPlace = new Map<number, Array<{ mint: string; p: number }>>();
+  for (const row of probabilities) {
+    const rows = byPlace.get(row.place) ?? [];
+    rows.push({ mint: row.mint, p: row.p });
+    byPlace.set(row.place, rows);
+  }
+  for (let place = 1; place <= places; place++) {
+    const rows = byPlace.get(place) ?? [];
+    const mass = rows.reduce((sum, row) => sum + row.p, 0);
+    const distinct = new Set(rows.map((row) => row.mint)).size;
+    if (distinct !== rows.length) throw new Error('order coverage is not distinct');
+    if (mass >= 0.999999) throw new Error('no probability remains for unseen launches');
+    if (rows.length === 0) throw new Error('order coverage names no observed candidates');
+  }
+}
+
+function validateSizeCoverage(): void {
+  const byPlace = new Map<number, number>();
+  for (const row of sizes) byPlace.set(row.place, (byPlace.get(row.place) ?? 0) + 1);
+  for (let place = 1; place <= places; place++) {
+    const count = byPlace.get(place) ?? 0;
+    if (count === 0) throw new Error('size coverage names no bins');
+    if (count > edges.length + 1) throw new Error('size coverage has too many bins');
+  }
+}
+
 function debugHealth(): void {
   if (process.env.MAKEFUN_DEBUG !== '1') return;
   const health = forecastHealth();
@@ -836,6 +863,8 @@ function validateForecast(): void {
   validateTop5(top5);
   validateSizeRows(sizes);
   validateKnownMints();
+  validateOrderCoverage();
+  validateSizeCoverage();
   if (probabilities.length > places * 100) throw new Error('too many order rows');
   if (sizes.length > places * (edges.length + 1)) throw new Error('too many size rows');
 }
