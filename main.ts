@@ -738,15 +738,110 @@ function validateTop5(rows: string[]): void {
   }
 }
 
+type ForecastHealth = {
+  place: number;
+  namedOrderMass: number;
+  namedSizeMass: number;
+  orderRows: number;
+  sizeRows: number;
+  unknownOrderMass: number;
+  entropy: number;
+};
+
+function entropy(rows: Array<{ p: number }>, remainder: number, slots: number): number {
+  let value = 0;
+  for (const row of rows) {
+    if (row.p > 0) value -= row.p * Math.log(row.p);
+  }
+  if (remainder > 0 && slots > 0) {
+    const each = remainder / slots;
+    if (each > 0) value -= remainder * Math.log(each);
+  }
+  return value;
+}
+
+function healthForPlace(place: number): ForecastHealth {
+  const orderRows = probabilities.filter((row) => row.place === place);
+  const sizeRows = sizes.filter((row) => row.place === place);
+  const namedOrderMass = orderRows.reduce((sum, row) => sum + row.p, 0);
+  const namedSizeMass = sizeRows.reduce((sum, row) => sum + row.p, 0);
+  const unnamedCoins = Math.max(1, task.chart_size - orderRows.length);
+  const unnamedBins = Math.max(1, edges.length + 1 - sizeRows.length);
+  const orderEntropy = entropy(orderRows, Math.max(0, 1 - namedOrderMass), unnamedCoins);
+  const sizeEntropy = entropy(sizeRows, Math.max(0, 1 - namedSizeMass), unnamedBins);
+  return {
+    place,
+    namedOrderMass: Number(namedOrderMass.toFixed(6)),
+    namedSizeMass: Number(namedSizeMass.toFixed(6)),
+    orderRows: orderRows.length,
+    sizeRows: sizeRows.length,
+    unknownOrderMass: Number(Math.max(0, 1 - namedOrderMass).toFixed(6)),
+    entropy: Number((orderEntropy + sizeEntropy).toFixed(6)),
+  };
+}
+
+function forecastHealth(): ForecastHealth[] {
+  const result: ForecastHealth[] = [];
+  for (let place = 1; place <= places; place++) result.push(healthForPlace(place));
+  return result;
+}
+
+function validateHealth(rows: ForecastHealth[]): void {
+  if (rows.length !== places) throw new Error('health record has wrong number of places');
+  for (const row of rows) {
+    if (row.orderRows > 100) throw new Error('health found too many order rows');
+    if (row.sizeRows > edges.length + 1) throw new Error('health found too many size rows');
+    if (row.namedOrderMass < 0 || row.namedOrderMass > 1 + 1e-6) throw new Error('health found invalid order mass');
+    if (row.namedSizeMass < 0 || row.namedSizeMass > 1 + 1e-6) throw new Error('health found invalid size mass');
+    if (row.unknownOrderMass < 0 || row.unknownOrderMass > 1 + 1e-6) throw new Error('health found invalid unnamed mass');
+    if (!Number.isFinite(row.entropy) || row.entropy < 0) throw new Error('health found invalid entropy');
+  }
+}
+
+function stableTop5(): string[] {
+  const available = new Set(coins.map((coin) => coin.mint));
+  const result: string[] = [];
+  for (const mint of top5) {
+    if (available.has(mint) && !result.includes(mint)) result.push(mint);
+  }
+  for (const coin of coins) {
+    if (result.length >= places) break;
+    if (!result.includes(coin.mint)) result.push(coin.mint);
+  }
+  if (result.length !== places) throw new Error('cannot build a stable top5');
+  return result;
+}
+
+function validateKnownMints(): void {
+  const historyMints = new Set<string>();
+  for (const mark of marks) for (const row of mark.rows) historyMints.add(row.mint);
+  for (const row of probabilities) {
+    if (!historyMints.has(row.mint)) throw new Error('probability names a mint absent from history');
+  }
+  for (const mint of top5) {
+    if (!historyMints.has(mint)) throw new Error('top5 names a mint absent from history');
+  }
+}
+
+function debugHealth(): void {
+  if (process.env.MAKEFUN_DEBUG !== '1') return;
+  const health = forecastHealth();
+  validateHealth(health);
+  console.error(JSON.stringify({ forecastHealth: health, reserve: reserveDiagnostics() }));
+}
+
 function validateForecast(): void {
   validateOrderRows(probabilities);
+  top5.splice(0, top5.length, ...stableTop5());
   validateTop5(top5);
   validateSizeRows(sizes);
+  validateKnownMints();
   if (probabilities.length > places * 100) throw new Error('too many order rows');
   if (sizes.length > places * (edges.length + 1)) throw new Error('too many size rows');
 }
 
 validateForecast();
+debugHealth();
 const forecast = { probabilities, top5, sizes };
 const text = `${JSON.stringify(forecast)}\n`;
 if (text.length > 1_048_576) throw new Error(`forecast is ${text.length} bytes`);
